@@ -568,3 +568,69 @@ tt.func @test_combine_broadcast_mul_reduce_higher_rank(%arg0: tensor<32x16x4xf32
     }) : (tensor<32x16x32x4xf32>) -> tensor<32x32x4xf32>
     tt.return %5 : tensor<32x32x4xf32>
 }
+
+// CHECK-LABEL: @test_combine_trunc_div_pow2_to_mul
+tt.func @test_combine_trunc_div_pow2_to_mul(%arg0: tensor<8xf16>, %arg1: tensor<8xbf16>, %arg2: f16) -> (tensor<8xf16>, tensor<8xf16>, tensor<8xbf16>, f16) {
+    %two = arith.constant dense<2.0> : tensor<8xf32>
+    %neg_quarter = arith.constant dense<-2.5e-1> : tensor<8xf32>
+    %half = arith.constant dense<0.5> : tensor<8xf32>
+    %two_scalar = arith.constant 2.0 : f32
+
+    // CHECK: %[[div2:.*]] = arith.mulf %arg0, %{{.*}} : tensor<8xf16>
+    %e0 = arith.extf %arg0 : tensor<8xf16> to tensor<8xf32>
+    %d0 = arith.divf %e0, %two : tensor<8xf32>
+    %div2 = arith.truncf %d0 : tensor<8xf32> to tensor<8xf16>
+
+    // Negative power of two also has an exact reciprocal.
+    // CHECK: %[[divneg:.*]] = arith.mulf %arg0, %{{.*}} : tensor<8xf16>
+    %e1 = arith.extf %arg0 : tensor<8xf16> to tensor<8xf32>
+    %d1 = arith.divf %e1, %neg_quarter : tensor<8xf32>
+    %divneg = arith.truncf %d1 : tensor<8xf32> to tensor<8xf16>
+
+    // CHECK: %[[divbf:.*]] = arith.mulf %arg1, %{{.*}} : tensor<8xbf16>
+    %e2 = arith.extf %arg1 : tensor<8xbf16> to tensor<8xf32>
+    %d2 = arith.divf %e2, %half : tensor<8xf32>
+    %divbf = arith.truncf %d2 : tensor<8xf32> to tensor<8xbf16>
+
+    // Scalar (non-tensor) form.
+    // CHECK: %[[divs:.*]] = arith.mulf %arg2, %{{.*}} : f16
+    %e3 = arith.extf %arg2 : f16 to f32
+    %d3 = arith.divf %e3, %two_scalar : f32
+    %divs = arith.truncf %d3 : f32 to f16
+
+    // CHECK: tt.return %[[div2]], %[[divneg]], %[[divbf]], %[[divs]]
+    tt.return %div2, %divneg, %divbf, %divs : tensor<8xf16>, tensor<8xf16>, tensor<8xbf16>, f16
+}
+
+// CHECK-LABEL: @test_combine_trunc_div_pow2_to_mul_fail
+// CHECK-NOT: arith.mulf
+tt.func @test_combine_trunc_div_pow2_to_mul_fail(%arg0: tensor<8xf16>, %arg1: tensor<8xf32>) -> (tensor<8xf16>, tensor<8xf16>, tensor<8xf16>, tensor<8xf32>, tensor<8xbf16>) {
+    %three = arith.constant dense<3.0> : tensor<8xf32>
+    %tiny = arith.constant dense<7.62939453125e-06> : tensor<8xf32>
+    %two = arith.constant dense<2.0> : tensor<8xf32>
+
+    // Case 1: 1/3 is not exact — must stay a division.
+    %e0 = arith.extf %arg0 : tensor<8xf16> to tensor<8xf32>
+    %d0 = arith.divf %e0, %three : tensor<8xf32>
+    %r0 = arith.truncf %d0 : tensor<8xf32> to tensor<8xf16>
+
+    // Case 2: divisor 2^-17 has reciprocal 2^17 = 131072, which overflows
+    // f16 (max 65504) — must stay a division.
+    %e1 = arith.extf %arg0 : tensor<8xf16> to tensor<8xf32>
+    %d1 = arith.divf %e1, %tiny : tensor<8xf32>
+    %r1 = arith.truncf %d1 : tensor<8xf32> to tensor<8xf16>
+
+    // Case 3: division result has a second user — value in f32 is live.
+    %e2 = arith.extf %arg0 : tensor<8xf16> to tensor<8xf32>
+    %d2 = arith.divf %e2, %two : tensor<8xf32>
+    %r2t = arith.truncf %d2 : tensor<8xf32> to tensor<8xf16>
+    %r2 = arith.addf %d2, %e2 : tensor<8xf32>
+
+    // Case 4: not a round-trip — extf from f16 but truncf to bf16.
+    %e3 = arith.extf %arg0 : tensor<8xf16> to tensor<8xf32>
+    %d3 = arith.divf %e3, %two : tensor<8xf32>
+    %r3 = arith.truncf %d3 : tensor<8xf32> to tensor<8xbf16>
+
+    // CHECK: tt.return
+    tt.return %r0, %r1, %r2t, %r2, %r3 : tensor<8xf16>, tensor<8xf16>, tensor<8xf16>, tensor<8xf32>, tensor<8xbf16>
+}

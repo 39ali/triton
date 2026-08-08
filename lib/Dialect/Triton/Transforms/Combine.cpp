@@ -292,6 +292,73 @@ using CombineDotAddFPattern = CombineDotAddPattern<DotOp, arith::AddFOp>;
 using CombineDotScaledAddFPattern =
     CombineDotAddPattern<DotScaledOp, arith::AddFOp>;
 
+// truncf(divf(extf(x), c)) => mulf(x, 1/c)
+
+class CombineTruncDivPow2Pattern : public mlir::OpRewritePattern<arith::TruncFOp> {
+private:
+  // Return the value of \p val if it is statically known to be a float
+  // constant (scalar constant, dense splat constant, or a splat of a scalar
+  // constant).
+  static std::optional<llvm::APFloat> getSplatFloatConstant(Value val) {
+    if (auto splatOp = val.getDefiningOp<SplatOp>())
+      val = splatOp.getSrc();
+    Attribute attr;
+    if (!matchPattern(val, m_Constant(&attr)))
+      return std::nullopt;
+    if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
+      if (!denseAttr.isSplat())
+        return std::nullopt;
+      attr = denseAttr.getSplatValue<Attribute>();
+    }
+    if (auto floatAttr = dyn_cast_or_null<FloatAttr>(attr))
+      return floatAttr.getValue();
+    return std::nullopt;
+  }
+
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(arith::TruncFOp truncOp,
+                  mlir::PatternRewriter &rewriter) const override {
+    // Only the default (round-to-nearest-even) truncation rounds like mulf.
+    if (truncOp.getRoundingmode())
+      return failure();
+    auto divOp = truncOp.getIn().getDefiningOp<arith::DivFOp>();
+    if (!divOp || !divOp->hasOneUse())
+      return failure();
+    auto extOp = divOp.getLhs().getDefiningOp<arith::ExtFOp>();
+    if (!extOp)
+      return failure();
+    Value x = extOp.getIn();
+    // The chain must be a round-trip back to the type it started from.
+    if (x.getType() != truncOp.getType())
+      return failure();
+    Type elemTy = getElementTypeOrSelf(x.getType());
+    if (!elemTy.isF16() && !elemTy.isBF16() && !elemTy.isF32())
+      return failure();
+    auto divisor = getSplatFloatConstant(divOp.getRhs());
+    if (!divisor)
+      return failure();
+    llvm::APFloat recip(divisor->getSemantics());
+    if (!divisor->getExactInverse(&recip))
+      return failure();
+    bool losesInfo = false;
+    if (recip.convert(cast<FloatType>(elemTy).getFloatSemantics(),
+                      llvm::APFloat::rmNearestTiesToEven,
+                      &losesInfo) != llvm::APFloat::opOK ||
+        losesInfo)
+      return failure();
+    Attribute recipAttr = FloatAttr::get(elemTy, recip);
+    if (auto shapedTy = dyn_cast<ShapedType>(truncOp.getType()))
+      recipAttr = DenseElementsAttr::get(shapedTy, recipAttr);
+    auto cst = arith::ConstantOp::create(rewriter, truncOp.getLoc(),
+                                         cast<TypedAttr>(recipAttr));
+    rewriter.replaceOpWithNewOp<arith::MulFOp>(truncOp, x, cst);
+    return success();
+  }
+};
+
 } // anonymous namespace
 
 class CombineOpsPass : public impl::TritonCombineOpsBase<CombineOpsPass> {
@@ -309,6 +376,7 @@ public:
     patterns.add<CombineBroadcastMulReducePattern>(context);
     patterns.add<CombineReshapeReducePatterns>(context);
     patterns.add<RankedReduceDescriptorLoads>(context);
+    patterns.add<CombineTruncDivPow2Pattern>(context);
 
     if (applyPatternsGreedily(m, std::move(patterns)).failed())
       signalPassFailure();
