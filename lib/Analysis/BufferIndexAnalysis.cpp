@@ -320,6 +320,14 @@ bool BufferIndexAnalysis::isBackedgeSuccessor(Operation *terminator,
                                               Block *successor) const {
   if (isa<BranchOpInterface>(terminator))
     return dominanceInfo.dominates(successor, terminator->getBlock());
+
+  if (auto regionTerminator =
+          dyn_cast<RegionBranchTerminatorOpInterface>(terminator)) {
+    Operation *parent = regionTerminator->getParentOp();
+    if (isa_and_nonnull<RegionBranchOpInterface>(parent))
+      return successor->getParent() != nullptr &&
+             successor->getParent()->getParentOp() == parent;
+  }
   return false;
 }
 
